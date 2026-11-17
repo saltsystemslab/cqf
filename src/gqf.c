@@ -650,6 +650,9 @@ static inline int probably_is_empty(const QF *qf, uint64_t slot_index)
 static inline uint64_t find_first_empty_slot(QF *qf, uint64_t from)
 {
 	do {
+		/* No empty slot left: callers check for >= xnslots. */
+		if (from >= qf->metadata->xnslots)
+			return qf->metadata->xnslots;
 		int t = offset_lower_bound(qf, from);
 		assert(t>=0);
 		if (t == 0)
@@ -708,6 +711,17 @@ static inline void shift_remainders(QF *qf, const uint64_t start_index, const
 	const uint64_t first_word = start_index * qf->metadata->bits_per_slot / 64;
 	int bend = ((empty_index + 1) * qf->metadata->bits_per_slot) % 64;
 	const int bstart = (start_index * qf->metadata->bits_per_slot) % 64;
+
+	/* If the empty slot ends exactly at a word boundary, no bit of
+		 last_word takes part in the shift, so skip that word.  If the empty
+		 slot is the last slot of the table, last_word lies past the end of
+		 the allocation.  (Processing it with bend == 0 also ORs the empty
+		 slot's contents into the next slot; that only does no harm because
+		 empty slots are normally zero.) */
+	if (bend == 0) {
+		last_word--;
+		bend = 64;
+	}
 
 	while (last_word != first_word) {
 		*REMAINDER_WORD(qf, last_word) = shift_into_b(*REMAINDER_WORD(qf, last_word-1),
@@ -815,6 +829,14 @@ static inline void shift_runends(QF *qf, int64_t first, uint64_t last,
 	uint64_t bstart = first % 64;
 	uint64_t last_word = (last + distance + 1) / 64;
 	uint64_t bend = (last + distance + 1) % 64;
+
+	/* Same as in shift_remainders(): if the shifted range ends exactly at
+		 a word boundary, last_word is not part of it (and may lie past the
+		 end of the table), so skip it. */
+	if (bend == 0) {
+		last_word--;
+		bend = 64;
+	}
 
 	if (last_word != first_word) {
 		METADATA_WORD(qf, runends, 64*last_word) = shift_into_b(METADATA_WORD(qf, runends, 64*(last_word-1)), 
@@ -1204,6 +1226,12 @@ static inline int insert1(QF *qf, __uint128_t hash, uint8_t runtime_lock)
 		modify_metadata(&qf->runtimedata->pc_nelts, 1);
 	} else {
 		uint64_t runend_index              = run_end(qf, hash_bucket_index);
+		/* The extended-counter case below rewrites digits in place before
+			 it knows whether the counter has to grow.  Keep the old digits so
+			 that a failed insert (no empty slot left) can be undone. */
+		uint64_t saved_digits[67];
+		uint64_t nsaved = 0, lsd_index = 0;
+		int new_distinct = 0;
 		int operation = 0; /* Insert into empty bucket */
 		uint64_t insert_index = runend_index + 1;
 		uint64_t new_value = hash_remainder;
@@ -1233,10 +1261,11 @@ static inline int insert1(QF *qf, __uint128_t hash, uint8_t runtime_lock)
 				/* Otherwise, exactly one 0 (i.e. zero_terminator == runstart_index) */
 
 				/* May read past end of run, but that's OK because loop below
-					 can handle that */
+					 can handle that -- as long as we stay inside the table. */
 				if (hash_remainder != 0) {
 					runstart_index = zero_terminator + 1;
-					current_remainder = get_slot(qf, runstart_index);
+					current_remainder = runstart_index <= runend_index ?
+						get_slot(qf, runstart_index) : 0;
 				}
 			}
 
@@ -1257,10 +1286,11 @@ static inline int insert1(QF *qf, __uint128_t hash, uint8_t runtime_lock)
 					runstart_index++;
 				}
 
-				/* This may read past the end of the run, but the while loop
-					 condition will prevent us from using the invalid result in
-					 that case. */
-				current_remainder = get_slot(qf, runstart_index);
+				/* Past the end of the run the value is never used (the loop
+					 condition stops first), and if the run ends at the last slot
+					 of the table, reading it would go past the table. */
+				current_remainder = runstart_index <= runend_index ?
+					get_slot(qf, runstart_index) : 0;
 			}
 
 			/* If this is the first time we've inserted the new remainder,
@@ -1269,7 +1299,7 @@ static inline int insert1(QF *qf, __uint128_t hash, uint8_t runtime_lock)
 				operation = 1;
 				insert_index = runstart_index;
 				new_value = hash_remainder;
-				modify_metadata(&qf->runtimedata->pc_ndistinct_elts, 1);
+				new_distinct = 1;
 
 				/* This is the first time we're inserting this remainder, but
 					 there are larger remainders already in the run. */
@@ -1277,7 +1307,7 @@ static inline int insert1(QF *qf, __uint128_t hash, uint8_t runtime_lock)
 				operation = 2; /* Inserting */
 				insert_index = runstart_index;
 				new_value = hash_remainder;
-				modify_metadata(&qf->runtimedata->pc_ndistinct_elts, 1);
+				new_distinct = 1;
 
 				/* Cases below here: we're incrementing the (simple or
 					 extended) counter for this remainder. */
@@ -1315,9 +1345,12 @@ static inline int insert1(QF *qf, __uint128_t hash, uint8_t runtime_lock)
 
 				/* Increment the counter. */
 				uint64_t digit, carry;
+				lsd_index = insert_index;
 				do {
 					carry = 0;
 					digit = get_slot(qf, insert_index);
+					assert(nsaved < 67);
+					saved_digits[nsaved++] = digit;
 					// Convert a leading 0 (which is special) to a normal encoded digit
 					if (digit == 0) {
 						digit++;
@@ -1364,14 +1397,21 @@ static inline int insert1(QF *qf, __uint128_t hash, uint8_t runtime_lock)
 				}
 			}
 		} else {
-			modify_metadata(&qf->runtimedata->pc_ndistinct_elts, 1);
+			new_distinct = 1;
 		}
 
 		if (operation >= 0) {
 			uint64_t empty_slot_index = find_first_empty_slot(qf, runend_index+1);
 			if (empty_slot_index >= qf->metadata->xnslots) {
-				return QF_NO_SPACE;
+				/* Undo an in-place counter increment, then release the lock. */
+				uint64_t d;
+				for (d = 0; d < nsaved; d++)
+					set_slot(qf, lsd_index - d, saved_digits[d]);
+				ret_distance = QF_NO_SPACE;
+				goto out;
 			}
+			if (new_distinct)
+				modify_metadata(&qf->runtimedata->pc_ndistinct_elts, 1);
 			shift_remainders(qf, insert_index, empty_slot_index);
 
 			set_slot(qf, insert_index, new_value);
@@ -1423,6 +1463,7 @@ static inline int insert1(QF *qf, __uint128_t hash, uint8_t runtime_lock)
 			(hash_bucket_block_offset % 64);
 	}
 
+out:
 	if (GET_NO_LOCK(runtime_lock) != QF_NO_LOCK) {
 		qf_unlock(qf, hash_bucket_index, /*small*/ true);
 	}
@@ -1478,8 +1519,10 @@ static inline int insert(QF *qf, __uint128_t hash, uint64_t count, uint8_t
 																																							p, 
 																																							&new_values[67] - p, 
 																																							0);
-			if (!ret)
-				return QF_NO_SPACE;
+			if (!ret) {
+				ret_distance = QF_NO_SPACE;	/* nothing was modified */
+				goto out;
+			}
 			modify_metadata(&qf->runtimedata->pc_ndistinct_elts, 1);
 			ret_distance = runstart_index - hash_bucket_index;
 		} else { /* Non-empty bucket */
@@ -1506,8 +1549,10 @@ static inline int insert(QF *qf, __uint128_t hash, uint64_t count, uint8_t
 																																								p, 
 																																								&new_values[67] - p, 
 																																								0);
-				if (!ret)
-					return QF_NO_SPACE;
+				if (!ret) {
+					ret_distance = QF_NO_SPACE;	/* nothing was modified */
+					goto out;
+				}
 				modify_metadata(&qf->runtimedata->pc_ndistinct_elts, 1);
 				ret_distance = (current_end + 1) - hash_bucket_index;
 				/* Found a counter for this remainder.  Add in the new count. */
@@ -1520,8 +1565,10 @@ static inline int insert(QF *qf, __uint128_t hash, uint64_t count, uint8_t
 																																					p, 
 																																					&new_values[67] - p, 
 																																					current_end - runstart_index + 1);
-			if (!ret)
-				return QF_NO_SPACE;
+			if (!ret) {
+				ret_distance = QF_NO_SPACE;	/* nothing was modified */
+				goto out;
+			}
 			ret_distance = runstart_index - hash_bucket_index;
 				/* No counter for this remainder, but there are larger
 					 remainders, so we're not appending to the bucket. */
@@ -1534,8 +1581,10 @@ static inline int insert(QF *qf, __uint128_t hash, uint64_t count, uint8_t
 																																								p, 
 																																								&new_values[67] - p, 
 																																								0);
-				if (!ret)
-					return QF_NO_SPACE;
+				if (!ret) {
+					ret_distance = QF_NO_SPACE;	/* nothing was modified */
+					goto out;
+				}
 				modify_metadata(&qf->runtimedata->pc_ndistinct_elts, 1);
 			ret_distance = runstart_index - hash_bucket_index;
 			}
@@ -1545,6 +1594,7 @@ static inline int insert(QF *qf, __uint128_t hash, uint64_t count, uint8_t
 		modify_metadata(&qf->runtimedata->pc_nelts, count);
 	}
 
+out:
 	if (GET_NO_LOCK(runtime_lock) != QF_NO_LOCK) {
 		qf_unlock(qf, hash_bucket_index, /*small*/ false);
 	}
@@ -1754,7 +1804,11 @@ bool qf_malloc(QF *qf, uint64_t nslots, uint64_t key_bits, uint64_t
 	uint64_t total_num_bytes = qf_init(qf, nslots, key_bits, value_bits,
 																		 hash, seed, NULL, 0);
 
-	void *buffer = malloc(total_num_bytes);
+	/* qf_init() does not clear the buffer (the file-backed path gets a
+		 zero-filled file from posix_fallocate()), so the table must be
+		 zeroed here: blocks with garbage metadata trip the assertion in
+		 find_first_empty_slot() or corrupt the filter. */
+	void *buffer = calloc(1, total_num_bytes);
 	if (buffer == NULL) {
 		perror("Couldn't allocate memory for the CQF.");
 		exit(EXIT_FAILURE);
@@ -1901,7 +1955,12 @@ int qf_insert(QF *qf, uint64_t key, uint64_t value, uint64_t count, uint8_t
 {
 	// We fill up the CQF up to 95% load factor.
 	// This is a very conservative check.
-	if (qf_get_num_occupied_slots(qf) >= qf->metadata->nslots * 0.95) {
+	// Read the global counter without pc_sync(): syncing on every insert
+	// makes all threads write the same cache lines and serialises them.
+	// The unsynced value lags by at most num_counters * threshold slots
+	// (8 * 100 here), which is negligible against the 95% limit.
+	if (__atomic_load_n(&qf->metadata->noccupied_slots, __ATOMIC_RELAXED) >=
+			qf->metadata->nslots * 0.95) {
 		if (qf->runtimedata->auto_resize) {
 			/*fprintf(stdout, "Resizing the CQF.\n");*/
 			if (qf->runtimedata->container_resize(qf, qf->metadata->nslots * 2) < 0)
@@ -1948,12 +2007,14 @@ int qf_insert(QF *qf, uint64_t key, uint64_t value, uint64_t count, uint8_t
 				}
 				fprintf(stderr, "Resize finished.\n");
 			} else {
+				/* ret stays as is: if the insert itself succeeded, the key is in
+					 the filter and must not be reported as QF_NO_SPACE. */
 				fprintf(stderr, "Resize failed\n");
-				ret = QF_NO_SPACE;
 			}
 		} else {
+			/* Same here: a long distance from the home slot is only a warning
+				 sign.  The key was inserted unless ret is already QF_NO_SPACE. */
 			fprintf(stderr, "The CQF is filling up.\n");
-			ret = QF_NO_SPACE;
 		}
 	}
 	return ret;
