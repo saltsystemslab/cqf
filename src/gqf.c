@@ -1754,7 +1754,11 @@ bool qf_malloc(QF *qf, uint64_t nslots, uint64_t key_bits, uint64_t
 	uint64_t total_num_bytes = qf_init(qf, nslots, key_bits, value_bits,
 																		 hash, seed, NULL, 0);
 
-	void *buffer = malloc(total_num_bytes);
+	/* qf_init() does not clear the buffer (the file-backed path gets a
+		 zero-filled file from posix_fallocate()), so the table must be
+		 zeroed here: blocks with garbage metadata trip the assertion in
+		 find_first_empty_slot() or corrupt the filter. */
+	void *buffer = calloc(1, total_num_bytes);
 	if (buffer == NULL) {
 		perror("Couldn't allocate memory for the CQF.");
 		exit(EXIT_FAILURE);
