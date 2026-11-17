@@ -712,6 +712,17 @@ static inline void shift_remainders(QF *qf, const uint64_t start_index, const
 	int bend = ((empty_index + 1) * qf->metadata->bits_per_slot) % 64;
 	const int bstart = (start_index * qf->metadata->bits_per_slot) % 64;
 
+	/* If the empty slot ends exactly at a word boundary, no bit of
+		 last_word takes part in the shift, so skip that word.  If the empty
+		 slot is the last slot of the table, last_word lies past the end of
+		 the allocation.  (Processing it with bend == 0 also ORs the empty
+		 slot's contents into the next slot; that only does no harm because
+		 empty slots are normally zero.) */
+	if (bend == 0) {
+		last_word--;
+		bend = 64;
+	}
+
 	while (last_word != first_word) {
 		*REMAINDER_WORD(qf, last_word) = shift_into_b(*REMAINDER_WORD(qf, last_word-1),
 																									*REMAINDER_WORD(qf, last_word),
@@ -818,6 +829,14 @@ static inline void shift_runends(QF *qf, int64_t first, uint64_t last,
 	uint64_t bstart = first % 64;
 	uint64_t last_word = (last + distance + 1) / 64;
 	uint64_t bend = (last + distance + 1) % 64;
+
+	/* Same as in shift_remainders(): if the shifted range ends exactly at
+		 a word boundary, last_word is not part of it (and may lie past the
+		 end of the table), so skip it. */
+	if (bend == 0) {
+		last_word--;
+		bend = 64;
+	}
 
 	if (last_word != first_word) {
 		METADATA_WORD(qf, runends, 64*last_word) = shift_into_b(METADATA_WORD(qf, runends, 64*(last_word-1)), 
