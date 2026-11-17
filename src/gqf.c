@@ -1242,10 +1242,11 @@ static inline int insert1(QF *qf, __uint128_t hash, uint8_t runtime_lock)
 				/* Otherwise, exactly one 0 (i.e. zero_terminator == runstart_index) */
 
 				/* May read past end of run, but that's OK because loop below
-					 can handle that */
+					 can handle that -- as long as we stay inside the table. */
 				if (hash_remainder != 0) {
 					runstart_index = zero_terminator + 1;
-					current_remainder = get_slot(qf, runstart_index);
+					current_remainder = runstart_index <= runend_index ?
+						get_slot(qf, runstart_index) : 0;
 				}
 			}
 
@@ -1266,10 +1267,11 @@ static inline int insert1(QF *qf, __uint128_t hash, uint8_t runtime_lock)
 					runstart_index++;
 				}
 
-				/* This may read past the end of the run, but the while loop
-					 condition will prevent us from using the invalid result in
-					 that case. */
-				current_remainder = get_slot(qf, runstart_index);
+				/* Past the end of the run the value is never used (the loop
+					 condition stops first), and if the run ends at the last slot
+					 of the table, reading it would go past the table. */
+				current_remainder = runstart_index <= runend_index ?
+					get_slot(qf, runstart_index) : 0;
 			}
 
 			/* If this is the first time we've inserted the new remainder,
