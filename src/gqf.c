@@ -1955,7 +1955,12 @@ int qf_insert(QF *qf, uint64_t key, uint64_t value, uint64_t count, uint8_t
 {
 	// We fill up the CQF up to 95% load factor.
 	// This is a very conservative check.
-	if (qf_get_num_occupied_slots(qf) >= qf->metadata->nslots * 0.95) {
+	// Read the global counter without pc_sync(): syncing on every insert
+	// makes all threads write the same cache lines and serialises them.
+	// The unsynced value lags by at most num_counters * threshold slots
+	// (8 * 100 here), which is negligible against the 95% limit.
+	if (__atomic_load_n(&qf->metadata->noccupied_slots, __ATOMIC_RELAXED) >=
+			qf->metadata->nslots * 0.95) {
 		if (qf->runtimedata->auto_resize) {
 			/*fprintf(stdout, "Resizing the CQF.\n");*/
 			if (qf->runtimedata->container_resize(qf, qf->metadata->nslots * 2) < 0)
